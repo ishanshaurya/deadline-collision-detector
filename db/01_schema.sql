@@ -86,3 +86,59 @@ CREATE TABLE enrollments (
 );
 
 -- ---------------------------------------------------------------------
+-- TEAMS (a student's team for one course) and TEAM_MEMBERS
+-- ---------------------------------------------------------------------
+CREATE TABLE teams (
+    team_id    SERIAL PRIMARY KEY,
+    user_id    INTEGER NOT NULL,
+    course_id  INTEGER NOT NULL,
+    name       VARCHAR(100) NOT NULL,
+    CONSTRAINT uq_team_scope UNIQUE (team_id, user_id, course_id),
+    CONSTRAINT fk_team_enrollment FOREIGN KEY (user_id, course_id)
+        REFERENCES enrollments(user_id, course_id) ON DELETE CASCADE
+);
+
+CREATE TABLE team_members (
+    member_id  SERIAL PRIMARY KEY,
+    team_id    INTEGER NOT NULL REFERENCES teams(team_id) ON DELETE CASCADE,
+    name       VARCHAR(100) NOT NULL,
+    srn        VARCHAR(20),
+    email      CITEXT,
+    phone      VARCHAR(20),
+    role       VARCHAR(60) NOT NULL,
+    CONSTRAINT uq_member_srn UNIQUE (team_id, srn)
+);
+
+-- ---------------------------------------------------------------------
+-- TASKS
+-- fk_task_enrollment: a student only has tasks for courses they take.
+-- fk_task_team: a team task uses one of that student's teams for the
+-- same course; team_id NULL means individual work.
+-- ---------------------------------------------------------------------
+CREATE TABLE tasks (
+    task_id          SERIAL PRIMARY KEY,
+    user_id          INTEGER NOT NULL REFERENCES users(user_id)     ON DELETE CASCADE,
+    course_id        INTEGER NOT NULL REFERENCES courses(course_id) ON DELETE CASCADE,
+    title            VARCHAR(200) NOT NULL,
+    description      TEXT,
+    task_type        task_kind NOT NULL,
+    deadline         TIMESTAMP NOT NULL,
+    estimated_hours  DECIMAL(5,2) NOT NULL,
+    priority         INTEGER NOT NULL DEFAULT 3,                -- 1 = highest
+    status           task_status NOT NULL DEFAULT 'PENDING',
+    team_id          INTEGER,
+    created_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    search_vector    TSVECTOR GENERATED ALWAYS AS (
+                         setweight(to_tsvector('english', coalesce(title, '')), 'A') ||
+                         setweight(to_tsvector('english', coalesce(description, '')), 'B')
+                     ) STORED,
+    CONSTRAINT valid_hours     CHECK (estimated_hours > 0),
+    CONSTRAINT valid_priority  CHECK (priority BETWEEN 1 AND 5),
+    CONSTRAINT fk_task_enrollment FOREIGN KEY (user_id, course_id)
+        REFERENCES enrollments(user_id, course_id) ON DELETE CASCADE,
+    CONSTRAINT fk_task_team FOREIGN KEY (team_id, user_id, course_id)
+        REFERENCES teams(team_id, user_id, course_id) ON DELETE SET NULL (team_id)
+);
+
+-- ---------------------------------------------------------------------
