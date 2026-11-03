@@ -142,3 +142,26 @@ CREATE TABLE tasks (
 );
 
 -- ---------------------------------------------------------------------
+-- STUDY_AVAILABILITY  (USERS 1:N, one row per user per day)
+-- ---------------------------------------------------------------------
+CREATE TABLE study_availability (
+    availability_id  SERIAL PRIMARY KEY,
+    user_id          INTEGER NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+    available_date   DATE NOT NULL,
+    available_hours  DECIMAL(4,2) NOT NULL,
+    CONSTRAINT valid_available_hours CHECK (available_hours >= 0 AND available_hours <= 24),
+    CONSTRAINT uq_user_day UNIQUE (user_id, available_date)
+);
+
+-- ---------------------------------------------------------------------
+-- TASK_DEPENDENCIES  (unary M:N on TASKS: task_id requires prerequisite_task_id)
+-- ---------------------------------------------------------------------
+CREATE TABLE task_dependencies (
+    dependency_id         SERIAL PRIMARY KEY,
+    task_id               INTEGER NOT NULL REFERENCES tasks(task_id) ON DELETE CASCADE,
+    prerequisite_task_id  INTEGER NOT NULL REFERENCES tasks(task_id) ON DELETE CASCADE,
+    CONSTRAINT no_self_dependency CHECK (task_id <> prerequisite_task_id),
+    CONSTRAINT uq_dependency UNIQUE (task_id, prerequisite_task_id)
+);
+
+-- ---------------------------------------------------------------------
