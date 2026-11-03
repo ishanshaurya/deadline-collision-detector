@@ -165,3 +165,14 @@ CREATE TABLE task_dependencies (
 );
 
 -- ---------------------------------------------------------------------
+-- INDEXES (plans compared in demo/analytics_queries.sql)
+-- ---------------------------------------------------------------------
+CREATE INDEX idx_tasks_user_deadline   ON tasks (user_id, deadline);
+CREATE INDEX idx_tasks_pending         ON tasks (user_id, deadline) WHERE status <> 'COMPLETED';
+CREATE INDEX idx_tasks_course          ON tasks (course_id);
+CREATE INDEX idx_tasks_search          ON tasks USING GIN (search_vector);
+CREATE INDEX idx_dep_prerequisite      ON task_dependencies (prerequisite_task_id);
+CREATE INDEX idx_enrollments_course    ON enrollments (course_id);
+CREATE INDEX idx_tasks_team            ON tasks (team_id);
+CREATE INDEX idx_team_members_team     ON team_members (team_id);
+CREATE INDEX idx_office_hours_staff    ON office_hours (staff_id);
