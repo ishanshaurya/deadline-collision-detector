@@ -153,3 +153,155 @@ export const removeTeamMember = sql(`DELETE FROM team_members m
 USING teams t
 WHERE m.member_id = $2 AND m.team_id = t.team_id AND t.user_id = $1`);
 
+// ------------------------------------------------------------------ tasks
+
+export type CourseType = "CC" | "EC";
+
+export type TaskRow = {
+  task_id: number; title: string; description: string | null;
+  course_id: number; course_code: string; course_name: string; course_type: CourseType; task_type: string;
+  deadline: string; estimated_hours: number; priority: number;
+  state: TaskState; prerequisite_count: number; dependent_count: number; updated_at: string;
+  team_id: number | null; team_name: string | null; work_mode: "INDIVIDUAL" | "TEAM";
+};
+
+/** Filter and sort vocabularies for the task list; values are passed to SQL as parameters. */
+export const TASK_FILTERS = {
+  status: { OPEN: "not done", PENDING: "pending", IN_PROGRESS: "in progress", OVERDUE: "overdue", COMPLETED: "done", ALL: "everything" },
+  mode: { INDIVIDUAL: "individual", TEAM: "team" },
+  focus: {
+    due_soon: `due in the next ${ANALYSIS.pressureWindow} days`,
+    colliding: `within ${ANALYSIS.defaultWindow}h of another deadline`,
+    overloaded: "due in an overloaded week",
+    infeasible: "can't be finished in time",
+  },
+  sort: { deadline: "deadline", priority: "priority", hours: "most hours", course: "subject", title: "title" },
+} as const;
+export type TaskSort = keyof typeof TASK_FILTERS.sort;
+
+const TASK_ORDER: Record<TaskSort, string> = {
+  deadline: "deadline",
+  priority: "priority, deadline",
+  hours: "estimated_hours DESC, deadline",
+  course: "course_code, deadline",
+  title: "title",
+};
+
+const taskListQueries = Object.fromEntries(
+  (Object.keys(TASK_ORDER) as TaskSort[]).map((key) => [
+    key,
+    sql<TaskRow>(`SELECT *
+FROM v_task_details t
+WHERE t.user_id = $1
+  AND ($2::int  IS NULL OR t.course_id = $2)
+  AND ($3::text IS NULL OR t.task_type::text = $3)
+  AND ($4::text = 'ALL' OR t.state = $4 OR ($4 = 'OPEN' AND t.state <> 'COMPLETED'))
+  AND ($5::text IS NULL OR t.work_mode = $5)
+  AND ($6::text IS NULL OR t.task_id IN (
+        SELECT task_id FROM fn_focus_tasks($1, $6, $7, $8, $9, LOCALTIMESTAMP)))
+ORDER BY (t.status = 'COMPLETED'), ${TASK_ORDER[key]}`),
+  ]),
+) as Record<TaskSort, ReturnType<typeof sql<TaskRow>>>;
+
+export type TaskQuery = {
+  courseId: number | null;
+  type: string | null;
+  status: keyof typeof TASK_FILTERS.status;
+  mode: keyof typeof TASK_FILTERS.mode | null;
+  focus: keyof typeof TASK_FILTERS.focus | null;
+  sort: TaskSort;
+};
+
+export function taskList(userId: number, f: TaskQuery) {
+  return taskListQueries[f.sort].run(
+    userId, f.courseId, f.type, f.status, f.mode, f.focus,
+    ANALYSIS.defaultWindow, ANALYSIS.pressureWindow, ANALYSIS.weeks,
+  );
+}
+
+export const taskById = sql<TaskRow & { hours_still_to_do: number }>(`SELECT t.*,
+       (SELECT COALESCE(SUM(x.estimated_hours), 0)
+        FROM (SELECT t.estimated_hours, t.state
+              UNION ALL
+              SELECT p.estimated_hours, p.state FROM fn_prerequisites(t.task_id) p) x
+        WHERE x.state <> 'COMPLETED') AS hours_still_to_do
+FROM v_task_details t
+WHERE t.task_id = $1 AND t.user_id = $2`);
+
+export type PrerequisiteRow = {
+  task_id: number; title: string; deadline: string; estimated_hours: number;
+  state: TaskState; depth: number; due_after_task: boolean;
+};
+export const prerequisites = sql<PrerequisiteRow>(`SELECT * FROM fn_prerequisites($1)`);
+
+export type DependentRow = { task_id: number; title: string; deadline: string; state: TaskState; depth: number };
+export const dependents = sql<DependentRow>(`SELECT * FROM fn_dependents($1)`);
+
+export const taskKinds = sql<{ kind: string }>(`SELECT unnest(enum_range(NULL::task_kind))::text AS kind`);
+
+export const addTask = sql(`CALL sp_add_task($1, $2, $3, $4, $5, $6, $7, $8, $9::int[], $10)`);
+export const completeTask = sql(`CALL sp_complete_task($1, $2)`);
+export const rescheduleTask = sql<{ p_shifted: number }>(`CALL sp_reschedule_task($1, $2, $3, $4)`);
+export const deleteTask = sql(`DELETE FROM tasks WHERE task_id = $1 AND user_id = $2`);
+
+// Matches in search snippets are wrapped in these markers by the database
+// and split back out here, so no HTML from task text is ever rendered.
+const MARK_START = "[[";
+const MARK_END = "]]";
+const searchQuery = sql<{
+  task_id: number; title: string; course_code: string; deadline: string; state: TaskState; rank: number; snippet: string;
+}>(`SELECT * FROM fn_search_tasks($1, $2, $3, $4)`);
+
+export type Segment = { text: string; match: boolean };
+export async function searchTasks(userId: number, q: string) {
+  const ran = await searchQuery.run(userId, q, MARK_START, MARK_END);
+  return {
+    ...ran,
+    rows: ran.rows.map((r) => ({
+      ...r,
+      snippet: r.snippet.split(MARK_START).flatMap((part, i): Segment[] => {
+        if (i === 0) return [{ text: part, match: false }];
+        const [hit, rest] = part.split(MARK_END);
+        return [{ text: hit, match: true }, { text: rest ?? "", match: false }];
+      }),
+    })),
+  };
+}
+
+// ------------------------------------------------------------------ courses
+
+export const enrolledCourses = sql<{ course_id: number; course_code: string; course_name: string }>(`SELECT c.course_id, c.course_code, c.course_name
+FROM enrollments e JOIN courses c USING (course_id)
+WHERE e.user_id = $1
+ORDER BY c.course_code`);
+
+export const availableCourses = sql<{
+  course_id: number; course_code: string; course_name: string; credits: number; description: string | null;
+}>(`SELECT c.*
+FROM courses c
+WHERE NOT EXISTS (
+    SELECT 1 FROM enrollments e
+    WHERE e.course_id = c.course_id AND e.user_id = $1
+)
+ORDER BY c.course_code`);
+
+export const enroll = sql(`INSERT INTO enrollments (user_id, course_id) VALUES ($1, $2)`);
+
+// ------------------------------------------------------------------ availability
+
+export type AvailabilityDay = { day: string; available_hours: number; is_set: boolean; is_weekend: boolean };
+export const availability = sql<AvailabilityDay>(`SELECT d::date AS day,
+       COALESCE(a.available_hours, 0) AS available_hours,
+       (a.availability_id IS NOT NULL) AS is_set,
+       fn_is_weekend(d::date) AS is_weekend
+FROM generate_series(CURRENT_DATE, CURRENT_DATE + $2::int - 1, INTERVAL '1 day') d
+LEFT JOIN study_availability a
+       ON a.user_id = $1 AND a.available_date = d::date
+ORDER BY d`);
+
+export const setPattern = sql(`CALL sp_set_availability($1, $2, $3, $4, $5)`);
+
+export const saveDays = sql(`INSERT INTO study_availability (user_id, available_date, available_hours)
+SELECT $1, d, h FROM unnest($2::date[], $3::numeric[]) AS x(d, h)
+ON CONFLICT (user_id, available_date)
+DO UPDATE SET available_hours = EXCLUDED.available_hours`);
