@@ -252,3 +252,301 @@ CREATE TRIGGER tasks_guard_completion
     FOR EACH ROW EXECUTE FUNCTION trg_guard_completion();
 
 -- =====================================================================
+-- ANALYTICS
+-- =====================================================================
+
+-- ---------------------------------------------------------------------
+-- fn_task_risk: deadline feasibility per upcoming task.
+--
+-- Work is scheduled Earliest-Deadline-First. For a single worker EDF is
+-- optimal, so the task set is feasible iff for every deadline d:
+--     (hours of upcoming tasks due by d) <= (study hours available by d)
+-- slack_hours = capacity_by_deadline - cumulative_demand. Negative slack
+-- means the deadline is missed under ANY ordering of the work.
+-- ---------------------------------------------------------------------
+CREATE FUNCTION fn_task_risk(p_user_id INTEGER, p_now TIMESTAMP)
+RETURNS TABLE (
+    task_id               INTEGER,
+    title                 VARCHAR,
+    course_code           VARCHAR,
+    task_type             task_kind,
+    deadline              TIMESTAMP,
+    estimated_hours       DECIMAL,
+    priority              INTEGER,
+    cumulative_demand     DECIMAL,
+    capacity_by_deadline  DECIMAL,
+    slack_hours           DECIMAL,
+    level                 load_level,
+    dependency_inversion  BOOLEAN
+) AS $$
+    WITH demand AS (
+        SELECT u.*,
+               SUM(u.estimated_hours) OVER (
+                   ORDER BY u.deadline RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+               ) AS cumulative_demand
+        FROM fn_upcoming_tasks(p_user_id, p_now) u
+    ),
+    capacity AS (
+        SELECT l.day,
+               SUM(l.available_hours) OVER (ORDER BY l.day) AS cumulative_capacity
+        FROM fn_daily_ledger(p_user_id, p_now::date,
+                             (SELECT MAX(deadline)::date FROM demand), p_now) l
+    )
+    SELECT d.task_id, d.title, d.course_code, d.task_type, d.deadline,
+           d.estimated_hours, d.priority, d.cumulative_demand,
+           c.cumulative_capacity,
+           c.cumulative_capacity - d.cumulative_demand,
+           fn_load_level(d.cumulative_demand, c.cumulative_capacity),
+           EXISTS (SELECT 1 FROM v_dependency_edges e WHERE e.task_id = d.task_id AND e.inverted)
+    FROM demand d
+    JOIN capacity c ON c.day = d.deadline::date
+    ORDER BY d.deadline, d.priority;
+$$ LANGUAGE sql STABLE;
+
+-- ---------------------------------------------------------------------
+-- fn_collision_pairs: every pair of upcoming tasks due within
+-- p_window_hours of each other (self-join)
+-- ---------------------------------------------------------------------
+CREATE FUNCTION fn_collision_pairs(
+    p_user_id      INTEGER,
+    p_window_hours INTEGER,
+    p_now          TIMESTAMP
+)
+RETURNS TABLE (
+    task_a_id      INTEGER, task_a VARCHAR, course_a VARCHAR, deadline_a TIMESTAMP,
+    task_b_id      INTEGER, task_b VARCHAR, course_b VARCHAR, deadline_b TIMESTAMP,
+    gap_hours      DECIMAL,
+    combined_hours DECIMAL,
+    cross_course   BOOLEAN
+) AS $$
+    WITH u AS (SELECT * FROM fn_upcoming_tasks(p_user_id, p_now))
+    SELECT a.task_id, a.title, a.course_code, a.deadline,
+           b.task_id, b.title, b.course_code, b.deadline,
+           ROUND(ABS(EXTRACT(EPOCH FROM (b.deadline - a.deadline))) / 3600, 1),
+           a.estimated_hours + b.estimated_hours,
+           a.course_id <> b.course_id
+    FROM u a
+    JOIN u b
+      ON b.task_id > a.task_id
+     AND b.deadline BETWEEN a.deadline - make_interval(hours => p_window_hours)
+                        AND a.deadline + make_interval(hours => p_window_hours)
+    ORDER BY 9, a.deadline;
+$$ LANGUAGE sql STABLE;
+
+-- ---------------------------------------------------------------------
+-- fn_collision_clusters: upcoming deadlines grouped into clusters where
+-- consecutive deadlines are within p_window_hours of each other
+-- (gaps-and-islands with LAG + running SUM). A cluster of 2+ tasks is a
+-- deadline collision. Capacity = study hours in the p_lead_days up to
+-- the cluster's last deadline.
+-- ---------------------------------------------------------------------
+CREATE FUNCTION fn_collision_clusters(
+    p_user_id      INTEGER,
+    p_window_hours INTEGER,
+    p_lead_days    INTEGER,
+    p_now          TIMESTAMP
+)
+RETURNS TABLE (
+    cluster_id        INTEGER,
+    starts_at         TIMESTAMP,
+    ends_at           TIMESTAMP,
+    task_count        INTEGER,
+    total_hours       DECIMAL,
+    available_hours   DECIMAL,
+    pressure          DECIMAL,
+    level             load_level,
+    tasks             TEXT[]
+) AS $$
+    WITH upcoming AS (
+        SELECT u.*,
+               CASE WHEN u.deadline - LAG(u.deadline) OVER w
+                         <= make_interval(hours => p_window_hours)
+                    THEN 0 ELSE 1 END AS starts_cluster
+        FROM fn_upcoming_tasks(p_user_id, p_now) u
+        WINDOW w AS (ORDER BY u.deadline, u.task_id)
+    ),
+    numbered AS (
+        SELECT *, SUM(starts_cluster) OVER (ORDER BY deadline, task_id) AS cluster_no
+        FROM upcoming
+    ),
+    clusters AS (
+        SELECT MIN(deadline) AS starts_at,
+               MAX(deadline) AS ends_at,
+               COUNT(*)::INTEGER AS task_count,
+               SUM(estimated_hours) AS total_hours,
+               array_agg(course_code || ': ' || title ORDER BY deadline) AS tasks
+        FROM numbered
+        GROUP BY cluster_no
+        HAVING COUNT(*) >= 2
+    ),
+    ledger AS (
+        SELECT * FROM fn_daily_ledger(p_user_id, p_now::date,
+                                      (SELECT MAX(ends_at)::date FROM clusters), p_now)
+    )
+    SELECT (ROW_NUMBER() OVER (ORDER BY cl.starts_at))::INTEGER,
+           cl.starts_at, cl.ends_at, cl.task_count, cl.total_hours,
+           cap.hours,
+           fn_load_ratio(cl.total_hours, cap.hours),
+           fn_load_level(cl.total_hours, cap.hours),
+           cl.tasks
+    FROM clusters cl
+    CROSS JOIN LATERAL (
+        SELECT SUM(l.available_hours) AS hours
+        FROM ledger l
+        WHERE l.day BETWEEN cl.ends_at::date - p_lead_days + 1 AND cl.ends_at::date
+    ) cap
+    ORDER BY cl.starts_at;
+$$ LANGUAGE sql STABLE;
+
+-- ---------------------------------------------------------------------
+-- fn_weekly_load: demand vs capacity per ISO week (Mon-Sun)
+-- ---------------------------------------------------------------------
+CREATE FUNCTION fn_weekly_load(
+    p_user_id INTEGER,
+    p_weeks   INTEGER,
+    p_now     TIMESTAMP
+)
+RETURNS TABLE (
+    week_start          DATE,
+    tasks_due           INTEGER,
+    demand_hours        DECIMAL,
+    capacity_hours      DECIMAL,
+    load_ratio          DECIMAL,
+    cumulative_demand   DECIMAL,
+    cumulative_capacity DECIMAL,
+    level               load_level
+) AS $$
+    WITH weeks AS (
+        SELECT date_trunc('week', l.day)::date AS week_start,
+               SUM(l.tasks_due)::INTEGER AS tasks_due,
+               SUM(l.due_hours)          AS demand_hours,
+               SUM(l.available_hours)    AS capacity_hours
+        FROM fn_daily_ledger(p_user_id, p_now::date,
+                             date_trunc('week', p_now)::date + 7 * p_weeks - 1, p_now) l
+        GROUP BY 1
+    )
+    SELECT week_start, tasks_due, demand_hours, capacity_hours,
+           fn_load_ratio(demand_hours, capacity_hours),
+           SUM(demand_hours)   OVER (ORDER BY week_start),
+           SUM(capacity_hours) OVER (ORDER BY week_start),
+           fn_load_level(demand_hours, capacity_hours)
+    FROM weeks
+    ORDER BY week_start;
+$$ LANGUAGE sql STABLE;
+
+-- ---------------------------------------------------------------------
+-- fn_daily_pressure: for each day, hours due in the next p_window days
+-- vs study hours in those same days (sliding window frame). Consecutive
+-- CRITICAL days are merged into a numbered high-risk period.
+-- ---------------------------------------------------------------------
+CREATE FUNCTION fn_daily_pressure(
+    p_user_id INTEGER,
+    p_days    INTEGER,
+    p_window  INTEGER,
+    p_now     TIMESTAMP
+)
+RETURNS TABLE (
+    day             DATE,
+    due_hours       DECIMAL,
+    available_hours DECIMAL,
+    window_demand   DECIMAL,
+    window_capacity DECIMAL,
+    pressure        DECIMAL,
+    level           load_level,
+    risk_period     INTEGER
+) AS $$
+    WITH windowed AS (
+        SELECT l.day, l.due_hours, l.available_hours,
+               SUM(l.due_hours)       OVER w AS window_demand,
+               SUM(l.available_hours) OVER w AS window_capacity
+        FROM fn_daily_ledger(p_user_id, p_now::date, p_now::date + p_days + p_window - 2, p_now) l
+        WINDOW w AS (ORDER BY l.day ROWS BETWEEN CURRENT ROW AND (p_window - 1) FOLLOWING)
+    ),
+    scored AS (
+        SELECT *, fn_load_level(window_demand, window_capacity) AS level
+        FROM windowed
+        WHERE day < p_now::date + p_days
+    ),
+    islands AS (
+        SELECT *,
+               CASE WHEN level = 'CRITICAL'
+                     AND LAG(level) OVER (ORDER BY day) IS DISTINCT FROM 'CRITICAL'
+                    THEN 1 ELSE 0 END AS starts_period
+        FROM scored
+    )
+    SELECT day, due_hours, available_hours, window_demand, window_capacity,
+           fn_load_ratio(window_demand, window_capacity),
+           level,
+           CASE WHEN level = 'CRITICAL'
+                THEN SUM(starts_period) OVER (ORDER BY day)::INTEGER
+           END
+    FROM islands
+    ORDER BY day;
+$$ LANGUAGE sql STABLE;
+
+-- ---------------------------------------------------------------------
+-- fn_focus_tasks: the tasks behind each dashboard number, so every
+-- headline figure can be opened as a list
+--   due_soon      upcoming, due within p_window_days
+--   colliding     in at least one collision pair
+--   infeasible    CRITICAL in the EDF feasibility check
+--   overloaded    due in a CRITICAL week
+-- ---------------------------------------------------------------------
+CREATE FUNCTION fn_focus_tasks(
+    p_user_id      INTEGER,
+    p_focus        TEXT,
+    p_window_hours INTEGER,
+    p_window_days  INTEGER,
+    p_weeks        INTEGER,
+    p_now          TIMESTAMP
+)
+RETURNS TABLE (task_id INTEGER) AS $$
+    SELECT u.task_id FROM fn_upcoming_tasks(p_user_id, p_now) u
+    WHERE p_focus = 'due_soon' AND u.deadline::date < p_now::date + p_window_days
+    UNION
+    SELECT unnest(ARRAY[p.task_a_id, p.task_b_id])
+    FROM fn_collision_pairs(p_user_id, p_window_hours, p_now) p
+    WHERE p_focus = 'colliding'
+    UNION
+    SELECT r.task_id FROM fn_task_risk(p_user_id, p_now) r
+    WHERE p_focus = 'infeasible' AND r.level = 'CRITICAL'
+    UNION
+    SELECT u.task_id
+    FROM fn_upcoming_tasks(p_user_id, p_now) u
+    JOIN fn_weekly_load(p_user_id, p_weeks, p_now) w
+      ON w.week_start = date_trunc('week', u.deadline)::date
+    WHERE p_focus = 'overloaded' AND w.level = 'CRITICAL';
+$$ LANGUAGE sql STABLE;
+
+-- ---------------------------------------------------------------------
+-- fn_search_tasks: ranked full-text search over a student's tasks
+-- (websearch syntax: "exact phrase", -exclude, or). The caller chooses
+-- the markers that wrap matched words in the snippet.
+-- ---------------------------------------------------------------------
+CREATE FUNCTION fn_search_tasks(
+    p_user_id   INTEGER,
+    p_query     TEXT,
+    p_start_sel TEXT,
+    p_stop_sel  TEXT
+)
+RETURNS TABLE (
+    task_id     INTEGER,
+    title       VARCHAR,
+    course_code VARCHAR,
+    deadline    TIMESTAMP,
+    state       TEXT,
+    rank        REAL,
+    snippet     TEXT
+) AS $$
+    SELECT t.task_id, t.title, v.course_code, t.deadline, v.state,
+           ts_rank(t.search_vector, q),
+           ts_headline('english', coalesce(t.description, t.title), q,
+                       format('StartSel="%s", StopSel="%s", MaxWords=18, MinWords=6',
+                              p_start_sel, p_stop_sel))
+    FROM tasks t
+    JOIN v_task_details v ON v.task_id = t.task_id,
+         websearch_to_tsquery('english', p_query) q
+    WHERE t.user_id = p_user_id
+      AND t.search_vector @@ q
+    ORDER BY 6 DESC, t.deadline;
+$$ LANGUAGE sql STABLE;
