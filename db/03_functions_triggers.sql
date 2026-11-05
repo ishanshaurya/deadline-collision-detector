@@ -94,3 +94,81 @@ RETURNS TABLE (
 $$ LANGUAGE sql STABLE;
 
 -- ---------------------------------------------------------------------
+-- fn_prerequisites / fn_dependents: transitive closure of the
+-- dependency graph in each direction, each task once at its shallowest
+-- depth. The visited array stops the walk if a cycle exists.
+-- ---------------------------------------------------------------------
+CREATE FUNCTION fn_prerequisites(p_task_id INTEGER)
+RETURNS TABLE (
+    task_id          INTEGER,
+    title            VARCHAR,
+    deadline         TIMESTAMP,
+    estimated_hours  DECIMAL,
+    state            TEXT,
+    depth            INTEGER,
+    due_after_task   BOOLEAN
+) AS $$
+    WITH RECURSIVE walk(task_id, depth, visited) AS (
+        SELECT d.prerequisite_task_id, 1, ARRAY[d.prerequisite_task_id]
+        FROM task_dependencies d
+        WHERE d.task_id = p_task_id
+        UNION ALL
+        SELECT d.prerequisite_task_id, w.depth + 1, w.visited || d.prerequisite_task_id
+        FROM walk w
+        JOIN task_dependencies d ON d.task_id = w.task_id
+        WHERE NOT d.prerequisite_task_id = ANY (w.visited)
+    ),
+    shallowest AS (
+        SELECT DISTINCT ON (w.task_id) w.task_id, w.depth
+        FROM walk w
+        ORDER BY w.task_id, w.depth
+    )
+    SELECT t.task_id, t.title, t.deadline, t.estimated_hours, t.state, s.depth,
+           fn_is_late_prerequisite(t.status, t.deadline, root.deadline)
+    FROM shallowest s
+    JOIN v_task_details t ON t.task_id = s.task_id
+    JOIN tasks root       ON root.task_id = p_task_id
+    ORDER BY s.depth, t.deadline;
+$$ LANGUAGE sql STABLE;
+
+CREATE FUNCTION fn_dependents(p_task_id INTEGER)
+RETURNS TABLE (
+    task_id   INTEGER,
+    title     VARCHAR,
+    deadline  TIMESTAMP,
+    state     TEXT,
+    depth     INTEGER
+) AS $$
+    WITH RECURSIVE walk(task_id, depth, visited) AS (
+        SELECT d.task_id, 1, ARRAY[d.task_id]
+        FROM task_dependencies d
+        WHERE d.prerequisite_task_id = p_task_id
+        UNION ALL
+        SELECT d.task_id, w.depth + 1, w.visited || d.task_id
+        FROM walk w
+        JOIN task_dependencies d ON d.prerequisite_task_id = w.task_id
+        WHERE NOT d.task_id = ANY (w.visited)
+    ),
+    shallowest AS (
+        SELECT DISTINCT ON (w.task_id) w.task_id, w.depth
+        FROM walk w
+        ORDER BY w.task_id, w.depth
+    )
+    SELECT t.task_id, t.title, t.deadline, t.state, s.depth
+    FROM shallowest s
+    JOIN v_task_details t ON t.task_id = s.task_id
+    ORDER BY s.depth, t.deadline;
+$$ LANGUAGE sql STABLE;
+
+-- ---------------------------------------------------------------------
+-- v_dependency_edges: each direct dependency, flagged when the
+-- prerequisite is late
+-- ---------------------------------------------------------------------
+CREATE VIEW v_dependency_edges AS
+SELECT d.dependency_id, d.task_id, d.prerequisite_task_id,
+       fn_is_late_prerequisite(p.status, p.deadline, t.deadline) AS inverted
+FROM task_dependencies d
+JOIN tasks t ON t.task_id = d.task_id
+JOIN tasks p ON p.task_id = d.prerequisite_task_id;
+
+-- =====================================================================
