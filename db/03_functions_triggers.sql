@@ -172,3 +172,83 @@ JOIN tasks t ON t.task_id = d.task_id
 JOIN tasks p ON p.task_id = d.prerequisite_task_id;
 
 -- =====================================================================
+-- TRIGGERS
+-- =====================================================================
+
+CREATE FUNCTION trg_set_updated_at() RETURNS TRIGGER AS $$
+BEGIN
+    NEW.updated_at := CURRENT_TIMESTAMP;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER tasks_updated_at
+    BEFORE UPDATE ON tasks
+    FOR EACH ROW EXECUTE FUNCTION trg_set_updated_at();
+
+-- ---------------------------------------------------------------------
+-- validate a dependency edge after it is written:
+--   * both tasks belong to the same student
+--   * the graph has no cycle: the task must not be its own prerequisite
+-- The per-user advisory lock serialises concurrent edits; without it two
+-- transactions could each add half of a cycle and neither would see it.
+-- ---------------------------------------------------------------------
+CREATE FUNCTION trg_validate_dependency() RETURNS TRIGGER AS $$
+DECLARE
+    v_user_task   INTEGER;
+    v_user_prereq INTEGER;
+BEGIN
+    SELECT user_id INTO v_user_task   FROM tasks WHERE task_id = NEW.task_id;
+    SELECT user_id INTO v_user_prereq FROM tasks WHERE task_id = NEW.prerequisite_task_id;
+
+    IF v_user_task IS DISTINCT FROM v_user_prereq THEN
+        RAISE EXCEPTION 'Task % and prerequisite % belong to different users',
+            NEW.task_id, NEW.prerequisite_task_id
+            USING ERRCODE = 'check_violation';
+    END IF;
+
+    PERFORM pg_advisory_xact_lock(v_user_task);
+
+    IF EXISTS (SELECT 1 FROM fn_prerequisites(NEW.task_id) p WHERE p.task_id = NEW.task_id) THEN
+        RAISE EXCEPTION 'Dependency % -> % would create a cycle',
+            NEW.task_id, NEW.prerequisite_task_id
+            USING ERRCODE = 'check_violation';
+    END IF;
+
+    RETURN NULL;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER task_dependencies_validate
+    AFTER INSERT OR UPDATE ON task_dependencies
+    FOR EACH ROW EXECUTE FUNCTION trg_validate_dependency();
+
+-- ---------------------------------------------------------------------
+-- a task cannot be COMPLETED while a prerequisite is not
+-- ---------------------------------------------------------------------
+CREATE FUNCTION trg_guard_completion() RETURNS TRIGGER AS $$
+DECLARE
+    v_blocking TEXT;
+BEGIN
+    IF NEW.status = 'COMPLETED' AND OLD.status <> 'COMPLETED' THEN
+        SELECT string_agg(p.title, ', ' ORDER BY p.deadline) INTO v_blocking
+        FROM task_dependencies d
+        JOIN tasks p ON p.task_id = d.prerequisite_task_id
+        WHERE d.task_id = NEW.task_id
+          AND p.status <> 'COMPLETED';
+
+        IF v_blocking IS NOT NULL THEN
+            RAISE EXCEPTION 'Cannot complete "%": unfinished prerequisites: %',
+                NEW.title, v_blocking
+                USING ERRCODE = 'check_violation';
+        END IF;
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER tasks_guard_completion
+    BEFORE UPDATE OF status ON tasks
+    FOR EACH ROW EXECUTE FUNCTION trg_guard_completion();
+
+-- =====================================================================
