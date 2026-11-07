@@ -1,5 +1,9 @@
 # Deadline Collision Detector
 
+**DBMS Mini Project | Course Code: UE24CS351A**  
+**Department of Computer Science and Engineering, PES University, Bengaluru**  
+**Faculty Guide:** Dr. Shilpa S, Assistant Professor  
+
 An academic workload and deadline risk analysis system. It stores courses, enrollments, tasks with deadlines and estimated hours, task dependencies and each student's daily study availability, then analyses temporal overlaps and workload concentration to find deadline collisions, high-risk periods and overloaded weeks.
 
 **Stack:** PostgreSQL 15+ (all analytics live in the database as SQL/PLpgSQL) and Next.js 16 (App Router, server components, server actions, raw SQL through `pg`, no ORM). Every panel in the UI has a **Show SQL** toggle with the exact statement it ran.
@@ -219,3 +223,22 @@ Not used, on purpose: NoSQL, Neo4j and vector databases. The dependency graph is
 8. Search `spark OR kafka` on the Tasks page (full-text search with highlighted snippet).
 9. Availability: drop a weekend to 0 hours, save, return to the dashboard and show the risk change.
 10. In psql, run `demo/transactions.sql` scenario 3 in two terminals to show the concurrent-cycle protection.
+
+---
+
+## 8. Formal Project Report
+
+A formal project report is prepared and documented in [`DBMS MINI PROJECT REPORT - DEADLINE COLLISION DETECTOR.docx`](DBMS%20MINI%20PROJECT%20REPORT%20-%20DEADLINE%20COLLISION%20DETECTOR.docx). The report is structured into 11 chapters aligned with the course syllabus and viva requirements:
+
+1. **Introduction and Problem Definition**: Academic workload challenges, deadline clustering, prerequisite risks, EDF analysis, and core objectives.
+2. **ER Model and Relational Mapping**: Core entities (USERS, COURSES, TASKS), relationships, cardinality constraints, and relational reduction rules.
+3. **Relational Schema, Keys and Constraints**: Primary/foreign keys, composite foreign keys, unique and check constraints, enums, and normalization analysis (1NF, 2NF, 3NF, BCNF).
+4. **SQL Database Implementation (DDL)**: Complete table definitions and schema execution order (`db/01_schema.sql`).
+5. **DML Operations**: CRUD workflows, seed data generation, and atomic state updates (`db/05_seed.sql`).
+6. **Nested, Correlated, Recursive and Join Queries**: Analytical queries demonstrating joins, subqueries, and set operations (`db/demo/analytics_queries.sql`).
+7. **Advanced SQL Concepts**: Stored procedures, triggers, recursive CTEs, and window analytics (`db/03_functions_triggers.sql`, `db/04_procedures.sql`).
+8. **NoSQL / Vector Feature & Full-Text Search**: Native PostgreSQL tsvector indexing with GIN indexes and weighted ranking.
+9. **Next.js Interface**: Modern full-stack interface featuring interactive dashboards, collision visualizers, task filters, and course directories.
+10. **Backend Integration & Authentication**: Direct PostgreSQL pooling with `pg`, cookie sessions, and role-based access control.
+11. **Technology Justification & Individual Contribution**: Technical design rationale, reproducibility instructions, and detailed member contribution records.
+
