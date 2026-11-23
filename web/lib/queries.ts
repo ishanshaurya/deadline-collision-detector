@@ -39,8 +39,9 @@ export const register = sql<{ user_id: number }>(`INSERT INTO users (name, email
 VALUES ($1, $2, crypt($3, gen_salt('bf')))
 RETURNING user_id`);
 
-export const userById = sql<{ user_id: number; name: string; email: string }>(
-  `SELECT user_id, name, email FROM users WHERE user_id = $1`,
+export type Role = "STUDENT" | "ADMIN";
+export const userById = sql<{ user_id: number; name: string; email: string; role: Role }>(
+  `SELECT user_id, name, email, role FROM users WHERE user_id = $1`,
 );
 
 // ------------------------------------------------------------------ analytics
@@ -305,3 +306,88 @@ export const saveDays = sql(`INSERT INTO study_availability (user_id, available_
 SELECT $1, d, h FROM unnest($2::date[], $3::numeric[]) AS x(d, h)
 ON CONFLICT (user_id, available_date)
 DO UPDATE SET available_hours = EXCLUDED.available_hours`);
+
+// ------------------------------------------------------------------ notes (JSONB document store)
+
+export type ChecklistItem = { item: string; done: boolean };
+export type NoteRow = {
+  note_id: number; task_id: number; task_title: string; course_code: string;
+  text: string; tags: string[]; checklist: ChecklistItem[]; open_items: number;
+  doc: Record<string, unknown>; updated_at: string;
+};
+
+export const notesForTask = sql<NoteRow>(`SELECT * FROM v_task_notes
+WHERE task_id = $1 AND user_id = $2
+ORDER BY created_at`);
+
+export const notesForUser = sql<NoteRow>(`SELECT * FROM v_task_notes
+WHERE user_id = $1
+  AND ($2::text IS NULL OR doc @> jsonb_build_object('tags', jsonb_build_array($2::text)))
+ORDER BY updated_at DESC`);
+
+export const noteTags = sql<{ tag: string; notes: number }>(`SELECT tag, COUNT(*) AS notes
+FROM task_notes n
+JOIN tasks t ON t.task_id = n.task_id,
+     jsonb_array_elements_text(COALESCE(n.doc->'tags', '[]')) AS tag
+WHERE t.user_id = $1
+GROUP BY tag
+ORDER BY notes DESC, tag`);
+
+export const addNote = sql(`INSERT INTO task_notes (task_id, doc)
+SELECT task_id, fn_make_note_doc($3, $4::text[], $5::text[])
+FROM tasks
+WHERE task_id = $2 AND user_id = $1`);
+
+export const toggleNoteItem = sql(`UPDATE task_notes n
+SET doc = jsonb_set(n.doc, ARRAY['checklist', $3::int::text, 'done'],
+                    to_jsonb(NOT COALESCE((n.doc #>> ARRAY['checklist', $3::int::text, 'done'])::boolean, false)))
+FROM tasks t
+WHERE n.note_id = $2 AND t.task_id = n.task_id AND t.user_id = $1
+  AND $3::int < jsonb_array_length(COALESCE(n.doc->'checklist', '[]'))`);
+
+export const addNoteTag = sql(`UPDATE task_notes n
+SET doc = jsonb_set(n.doc, '{tags}', COALESCE(n.doc->'tags', '[]') || to_jsonb(lower(btrim($3::text))))
+FROM tasks t
+WHERE n.note_id = $2 AND t.task_id = n.task_id AND t.user_id = $1
+  AND btrim($3::text) <> ''
+  AND NOT COALESCE(n.doc->'tags', '[]') ? lower(btrim($3::text))`);
+
+export const removeNoteTag = sql(`UPDATE task_notes n
+SET doc = jsonb_set(n.doc, '{tags}', COALESCE(n.doc->'tags', '[]') - $3::text)
+FROM tasks t
+WHERE n.note_id = $2 AND t.task_id = n.task_id AND t.user_id = $1`);
+
+export const deleteNote = sql(`DELETE FROM task_notes n
+USING tasks t
+WHERE n.note_id = $2 AND t.task_id = n.task_id AND t.user_id = $1`);
+
+// ------------------------------------------------------------------ vectors (embedding store)
+
+export type SimilarRow = { task_id: number; title: string; course_code: string; state: TaskState; similarity: number };
+export const similarTasks = sql<SimilarRow>(`SELECT * FROM fn_similar_tasks($1, 5)`);
+
+export const vectorSearch = sql<SimilarRow & { deadline: string }>(`SELECT * FROM fn_vector_search($1, $2, 8)`);
+
+export const embeddingInfo = sql<{ model: string; dims: number; embedded_at: string; preview: number[] }>(`SELECT model, array_length(embedding, 1) AS dims, embedded_at, embedding[1:6] AS preview
+FROM task_embeddings
+WHERE task_id = $1`);
+
+// ------------------------------------------------------------------ admin (checked by role in the database)
+
+export type AdminRow = {
+  user_id: number; name: string; email: string; role: Role; created_at: string;
+  courses: number; pending_tasks: number; overdue_tasks: number; pending_hours: number; critical_tasks: number;
+};
+export const adminOverview = sql<AdminRow>(`SELECT * FROM v_admin_overview WHERE fn_is_admin($1) ORDER BY role, name`);
+
+export const adminCourses = sql<{
+  course_id: number; course_code: string; course_name: string; course_type: CourseType; semester: number; credits: number; students: number;
+}>(`SELECT c.course_id, c.course_code, c.course_name, c.course_type, c.semester, c.credits, COUNT(e.user_id) AS students
+FROM courses c
+LEFT JOIN enrollments e ON e.course_id = c.course_id
+WHERE fn_is_admin($1)
+GROUP BY c.course_id
+ORDER BY c.semester DESC, c.course_code`);
+
+export const adminSetRole = sql(`CALL sp_admin_set_role($1, $2, $3)`);
+export const adminAddCourse = sql(`CALL sp_admin_add_course($1, $2, $3, $4, $5, $6, $7)`);

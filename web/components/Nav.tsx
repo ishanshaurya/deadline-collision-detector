@@ -8,14 +8,16 @@ const NAV = [
   { href: "/collisions", label: "collisions" },
   { href: "/tasks", label: "tasks" },
   { href: "/courses", label: "courses" },
+  { href: "/notes", label: "notes" },
   { href: "/availability", label: "availability" },
 ];
 
-export function Nav() {
+export function Nav({ isAdmin }: { isAdmin: boolean }) {
   const path = usePathname();
+  const items = isAdmin ? [...NAV, { href: "/admin", label: "admin" }] : NAV;
   return (
     <nav aria-label="Main">
-      {NAV.map((n) => {
+      {items.map((n) => {
         const current = n.href === "/" ? path === "/" : path.startsWith(n.href);
         return (
           <Link key={n.href} href={n.href} className="nav-link" aria-current={current ? "page" : undefined}>

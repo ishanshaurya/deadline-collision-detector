@@ -41,3 +41,10 @@ export async function requireUser() {
   if (!user) redirect("/login");
   return user;
 }
+
+// The admin procedures and views also check the role inside the database.
+export async function requireAdmin() {
+  const user = await requireUser();
+  if (user.role !== "ADMIN") redirect("/");
+  return user;
+}

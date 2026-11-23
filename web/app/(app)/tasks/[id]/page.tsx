@@ -4,6 +4,8 @@ import * as Q from "@/lib/queries";
 import { requireUser } from "@/lib/session";
 import { fmtDateTime, hours, toInputDateTime } from "@/lib/format";
 import { Badge, Card, CourseTypeTag, DateChip, SqlPeek, TeamTable } from "@/components/ui";
+import { NoteForm, NoteItem } from "@/components/notes";
+import { Similarity } from "@/components/similarity";
 import { completeTask, deleteTask, rescheduleTask } from "@/app/actions";
 
 export default async function TaskDetail({ params }: { params: Promise<{ id: string }> }) {
@@ -11,14 +13,18 @@ export default async function TaskDetail({ params }: { params: Promise<{ id: str
   const id = Number((await params).id);
   if (!Number.isInteger(id)) notFound();
 
-  const [task, chain, dependents, teams] = await Promise.all([
+  const [task, chain, dependents, teams, notes, similar, embedding] = await Promise.all([
     Q.taskById.run(id, user.user_id),
     Q.prerequisites.run(id),
     Q.dependents.run(id),
     Q.teamsForUser.run(user.user_id),
+    Q.notesForTask.run(id, user.user_id),
+    Q.similarTasks.run(id),
+    Q.embeddingInfo.run(id),
   ]);
   const t = task.rows[0];
   if (!t) notFound();
+  const vec = embedding.rows[0];
   const team = teams.rows.find((tm) => tm.team_id === t.team_id);
 
   return (
@@ -116,6 +122,44 @@ export default async function TaskDetail({ params }: { params: Promise<{ id: str
             </ol>
           )}
           <SqlPeek query={dependents} />
+        </Card>
+      </div>
+
+      <div className="grid-2">
+        <Card title={`notes (${notes.rows.length})`} actions={<Link href="/notes" className="small" style={{ fontWeight: 600 }}>all notes →</Link>}>
+          <p className="muted small" style={{ margin: 0 }}>Each note is a JSONB document. Tags and checklist items are edited inside the document with jsonb_set.</p>
+          {notes.rows.length > 0 && (
+            <div className="notes">
+              {notes.rows.map((n) => <NoteItem key={n.note_id} n={n} />)}
+            </div>
+          )}
+          <NoteForm taskId={t.task_id} />
+          <SqlPeek query={notes} />
+        </Card>
+        <Card title="similar tasks">
+          <p className="muted small" style={{ margin: 0 }}>
+            Nearest neighbours by cosine similarity of the task embeddings (title, description, subject and notes).
+          </p>
+          {similar.rows.length === 0 ? <p className="empty">No other tasks yet.</p> : (
+            <div className="rows">
+              {similar.rows.map((s) => (
+                <div key={s.task_id} className="task-row">
+                  <div className="body">
+                    <Link href={`/tasks/${s.task_id}`} className="title">{s.title}</Link>
+                    <div className="meta"><span className="tag">{s.course_code}</span> <Badge level={s.state} /></div>
+                  </div>
+                  <Similarity value={s.similarity} />
+                </div>
+              ))}
+            </div>
+          )}
+          {vec && (
+            <p className="vec">
+              {vec.model} · {vec.dims} dims · re-embedded {fmtDateTime(vec.embedded_at)}<br />
+              [{vec.preview.map((x) => Number(x).toFixed(3)).join(", ")}, …]
+            </p>
+          )}
+          <SqlPeek query={similar} />
         </Card>
       </div>
     </>

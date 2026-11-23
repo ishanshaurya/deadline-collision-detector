@@ -3,10 +3,11 @@ import * as Q from "@/lib/queries";
 import { TASK_FILTERS, type TaskQuery, type TaskRow } from "@/lib/queries";
 import { requireUser } from "@/lib/session";
 import { fmtDateTime } from "@/lib/format";
-import { Card, Highlighted, SqlPeek, TaskRowItem } from "@/components/ui";
+import { Badge, Card, Highlighted, SqlPeek, TaskRowItem } from "@/components/ui";
+import { Similarity } from "@/components/similarity";
 import { addTask } from "@/app/actions";
 
-type Params = { q?: string; status?: string; course?: string; type?: string; mode?: string; focus?: string; sort?: string; group?: string };
+type Params = { q?: string; how?: string; status?: string; course?: string; type?: string; mode?: string; focus?: string; sort?: string; group?: string };
 
 function pick<T extends object>(vocab: T, value: string | undefined): keyof T | null {
   return value !== undefined && value in vocab ? (value as keyof T) : null;
@@ -16,6 +17,7 @@ export default async function Tasks({ searchParams }: { searchParams: Promise<Pa
   const user = await requireUser();
   const p = await searchParams;
   const q = p.q ?? "";
+  const bySimilarity = p.how === "similar";
   const bySubject = p.group === "subject";
 
   const [courses, kinds, teams] = await Promise.all([
@@ -36,8 +38,9 @@ export default async function Tasks({ searchParams }: { searchParams: Promise<Pa
   const [list, open, hits] = await Promise.all([
     Q.taskList(user.user_id, filters),
     Q.taskList(user.user_id, { courseId: null, type: null, status: "OPEN", mode: null, focus: null, sort: "deadline" }),
-    q ? Q.searchTasks(user.user_id, q) : null,
+    q && !bySimilarity ? Q.searchTasks(user.user_id, q) : null,
   ]);
+  const near = q && bySimilarity ? await Q.vectorSearch.run(user.user_id, q) : null;
 
   const groups = bySubject
     ? courses.rows
@@ -61,6 +64,11 @@ export default async function Tasks({ searchParams }: { searchParams: Promise<Pa
           <label htmlFor="q" className="sr-only">Search tasks</label>
           <input id="q" name="q" type="search" defaultValue={q} placeholder='spark OR kafka, "mini project", -report' />
           <button className="btn btn-ink">search</button>
+          <fieldset className="seg" style={{ flexBasis: "100%" }}>
+            <legend className="sr-only">Match by</legend>
+            <label><input type="radio" name="how" value="words" defaultChecked={!bySimilarity} />keywords</label>
+            <label><input type="radio" name="how" value="similar" defaultChecked={bySimilarity} />similar meaning (vectors)</label>
+          </fieldset>
         </form>
       </header>
 
@@ -80,6 +88,26 @@ export default async function Tasks({ searchParams }: { searchParams: Promise<Pa
             </div>
           )}
           <SqlPeek query={hits} />
+        </Card>
+      )}
+
+      {near && (
+        <Card title={`closest to “${q}” (${near.rows.length})`} actions={<Link href="/tasks" className="small" style={{ fontWeight: 600 }}>clear</Link>}>
+          <p className="muted small" style={{ margin: 0 }}>The query is embedded the same way as the tasks and ranked by cosine similarity, so typos still match.</p>
+          {near.rows.length === 0 ? <p className="empty">Nothing close enough.</p> : (
+            <div className="rows">
+              {near.rows.map((h) => (
+                <div key={h.task_id} className="task-row">
+                  <div className="body">
+                    <Link href={`/tasks/${h.task_id}`} className="title">{h.title}</Link>
+                    <div className="meta"><span className="tag">{h.course_code}</span> {fmtDateTime(h.deadline)} <Badge level={h.state} /></div>
+                  </div>
+                  <Similarity value={h.similarity} />
+                </div>
+              ))}
+            </div>
+          )}
+          <SqlPeek query={near} />
         </Card>
       )}
 

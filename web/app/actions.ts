@@ -6,7 +6,7 @@ import { revalidatePath } from "next/cache";
 import { dbErrorMessage } from "@/lib/db";
 import { withFlash, type FlashKind } from "@/lib/flash";
 import * as Q from "@/lib/queries";
-import { createSession, destroySession, MIN_PASSWORD_LENGTH, requireUser } from "@/lib/session";
+import { createSession, destroySession, MIN_PASSWORD_LENGTH, requireAdmin, requireUser } from "@/lib/session";
 
 function str(fd: FormData, key: string) {
   return String(fd.get(key) ?? "").trim();
@@ -41,7 +41,8 @@ export async function login(fd: FormData) {
   const { rows } = await Q.login.run(str(fd, "email"), str(fd, "password"));
   if (!rows[0]) redirect(withFlash("/login", "error", "Invalid email or password"));
   await createSession(rows[0].user_id);
-  redirect("/");
+  const { rows: [user] } = await Q.userById.run(rows[0].user_id);
+  redirect(user.role === "ADMIN" ? "/admin" : "/");
 }
 
 export async function register(fd: FormData) {
@@ -178,5 +179,86 @@ export async function saveDays(fd: FormData) {
   await settle(async () => {
     await Q.saveDays.run(user.user_id, fd.getAll("day").map(String), fd.getAll("hours").map(Number));
     return "Availability saved";
+  });
+}
+
+// ---------------------------------------------------------------- notes
+
+function lines(fd: FormData, key: string, sep: RegExp) {
+  return str(fd, key).split(sep).map((s) => s.trim()).filter(Boolean);
+}
+
+export async function addNote(fd: FormData) {
+  const user = await requireUser();
+  await settle(async () => {
+    const { rowCount } = await Q.addNote.run(
+      user.user_id,
+      Number(str(fd, "task_id")),
+      str(fd, "text"),
+      lines(fd, "tags", /,/),
+      lines(fd, "checklist", /\n/),
+    );
+    if (rowCount === 0) throw new Error("Task not found");
+    return "Note saved";
+  });
+}
+
+export async function toggleNoteItem(fd: FormData) {
+  const user = await requireUser();
+  await settle(async () => {
+    const { rowCount } = await Q.toggleNoteItem.run(user.user_id, Number(str(fd, "note_id")), Number(str(fd, "index")));
+    if (rowCount === 0) throw new Error("Checklist item not found");
+    return "Checklist updated";
+  });
+}
+
+export async function addNoteTag(fd: FormData) {
+  const user = await requireUser();
+  await settle(async () => {
+    const { rowCount } = await Q.addNoteTag.run(user.user_id, Number(str(fd, "note_id")), str(fd, "tag"));
+    return rowCount === 0 ? "Tag already there" : "Tag added";
+  });
+}
+
+export async function removeNoteTag(fd: FormData) {
+  const user = await requireUser();
+  await settle(async () => {
+    await Q.removeNoteTag.run(user.user_id, Number(str(fd, "note_id")), str(fd, "tag"));
+    return "Tag removed";
+  });
+}
+
+export async function deleteNote(fd: FormData) {
+  const user = await requireUser();
+  await settle(async () => {
+    const { rowCount } = await Q.deleteNote.run(user.user_id, Number(str(fd, "note_id")));
+    if (rowCount === 0) throw new Error("Note not found");
+    return "Note deleted";
+  });
+}
+
+// ---------------------------------------------------------------- admin
+
+export async function adminSetRole(fd: FormData) {
+  const user = await requireAdmin();
+  await settle(async () => {
+    await Q.adminSetRole.run(user.user_id, Number(str(fd, "user_id")), str(fd, "role"));
+    return "Role updated";
+  });
+}
+
+export async function adminAddCourse(fd: FormData) {
+  const user = await requireAdmin();
+  await settle(async () => {
+    await Q.adminAddCourse.run(
+      user.user_id,
+      str(fd, "course_code"),
+      str(fd, "course_name"),
+      str(fd, "course_type"),
+      Number(str(fd, "semester")),
+      Number(str(fd, "credits")),
+      str(fd, "description"),
+    );
+    return "Course added";
   });
 }

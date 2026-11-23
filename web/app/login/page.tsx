@@ -34,7 +34,7 @@ export default async function LoginPage({ searchParams }: { searchParams: Promis
             <label>password<input name="password" type="password" defaultValue="password123" required /></label>
             <button className="btn btn-ink">sign in</button>
             <p className="muted">
-              Demo users: aarav@, diya@, kabir@dcd.edu (password123).{" "}
+              Demo students: aarav@, diya@, kabir@dcd.edu. Admin: admin@dcd.edu. Password for all: password123.{" "}
               <Link href="/login?mode=register" style={{ fontWeight: 600 }}>Register</Link>
             </p>
           </form>

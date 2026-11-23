@@ -9,10 +9,11 @@ export default async function AppLayout({ children }: { children: React.ReactNod
     <div className="shell">
       <aside className="sidebar">
         <Logo />
-        <Nav />
+        <Nav isAdmin={user.role === "ADMIN"} />
         <div className="who">
           <strong>{user.name}</strong>
           <span className="who-email">{user.email}</span>
+          {user.role === "ADMIN" && <span className="pill pill-ink" style={{ alignSelf: "flex-start", marginTop: 6 }}>admin</span>}
           <form action={logout} style={{ marginTop: 10 }}>
             <button className="btn btn-sm">sign out</button>
           </form>
