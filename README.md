@@ -9,14 +9,14 @@ An academic workload and deadline risk analysis system. It stores courses, enrol
 **Stack:** PostgreSQL 15+ (all analytics live in the database as SQL/PLpgSQL) and Next.js 16 (App Router, server components, server actions, raw SQL through `pg`, no ORM). Every panel in the UI has a **Show SQL** toggle with the exact statement it ran.
 
 **Repository:** [github.com/ishanshaurya/deadline-collision-detector](https://github.com/ishanshaurya/deadline-collision-detector)  
-**Project work window:** November 2–7, 2026
+**Project work window:** November 2–16, 2026
 
 ## Individual contribution
 
 | Member | Contribution |
 |---|---|
-| **Shivansh Sharma (PES2UG24CS474)** | Relational schema and constraints, analytics SQL, procedures/triggers, database integration and report preparation. |
-| **Shaurya Ishan (PES2UG24CS464)** | Next.js screens and interaction flow, authentication UI/session handling, testing/demo preparation and documentation review. |
+| **Shivansh Sharma (PES2UG24CS474)** | Relational schema and constraints, analytics SQL, procedures/triggers, JSONB document store, in-database vector store, admin procedures, database roles and row-level security, demo scripts and report preparation. |
+| **Shaurya Ishan (PES2UG24CS464)** | Next.js screens and interaction flow, authentication UI/session handling, notes and similar-task screens, vector search, admin console, testing/demo preparation and documentation. |
 
 Both members contributed to requirements analysis, debugging, integration, viva preparation and final validation. The project’s originality is the combination of deadline-collision detection, prerequisite feasibility and study-capacity analysis in database-resident SQL rather than only in application code.
 
@@ -28,9 +28,14 @@ deadline-collision-detector/
 │   ├── 03_functions_triggers.sql  building blocks, graph traversal, 3 triggers, 6 analytics
 │   ├── 04_procedures.sql          4 stored procedures
 │   ├── 05_seed.sql                demo data (dates relative to CURRENT_DATE)
+│   ├── 06_documents.sql           NoSQL: JSONB note documents, GIN index, demo notes
+│   ├── 07_vectors.sql             vector store: embeddings, cosine similarity, triggers
+│   ├── 08_rbac.sql                ADMIN procedures, database roles, GRANTs, row-level security
 │   └── demo/
 │       ├── analytics_queries.sql  viva demo queries, tagged by syllabus topic
-│       └── transactions.sql       two-session locking / isolation scenarios
+│       ├── transactions.sql       two-session locking / isolation scenarios
+│       ├── nosql_vector.sql       document and vector read / update / delete
+│       └── rbac.sql               roles, GRANTs and row-level security in action
 ├── web/                           Next.js app
 └── DECISIONS.md                   refactor decision log
 ```
@@ -59,6 +64,7 @@ Demo logins (password `password123`):
 
 | User | Scenario |
 |---|---|
+| `admin@dcd.edu` | ADMIN role: all accounts with their workload, role changes, course catalogue |
 | `aarav@dcd.edu` | Main demo: collision clusters, an overloaded week, dependency chains, one dependency inversion, one overdue task |
 | `diya@dcd.edu`  | Control case (semester 4 courses): light, well-spread load |
 | `kabir@dcd.edu` | Chronically overloaded: low availability, five deadlines in 48 hours |
@@ -72,8 +78,11 @@ What the app does:
 - **Courses:** grouped by semester, each with its core/elective tag, share of your workload, and the professor and TA to contact (cabin, office hours, email, phone). There is no unenroll.
 - **Subject page:** contacts, every assignment for that subject, and its teams with a members table (name, role, SRN, email, phone). Teammates can be added and removed, and new teams created.
 - **Collisions, availability, login:** pile-up clusters and pairs at 24/48/72h, the daily study-hours editor, accounts.
+- **Notes:** free-form notes on any task, stored as JSONB documents (text, tags, checklist, any extra keys). Tick checklist items, add and remove tags, filter all notes by tag.
+- **Similar tasks and similarity search:** every task has an embedding; the task page lists its nearest neighbours and the Tasks search can match by similar meaning instead of keywords.
+- **Admin (admin@dcd.edu only):** every account with pending, overdue and won't-fit counts, role changes, and adding courses. The database refuses these operations for a non-admin.
 
-`npm run db:setup` runs every `db/*.sql` file in name order. The first file drops and recreates the whole `public` schema of `deadline_detector`, so rerun it any time to reset the demo, and don't point `DATABASE_URL` at a database you use for anything else. The files can also be run with `psql -f` in the same order; the `demo/` scripts are for psql only.
+`npm run db:setup` runs every `db/*.sql` file in name order. The first file drops and recreates the whole `public` schema of `deadline_detector`, so rerun it any time to reset the demo, and don't point `DATABASE_URL` at a database you use for anything else. The files can also be run with `psql -f` in the same order; the `demo/` scripts are for psql only. Run setup as a superuser such as `postgres`: `08_rbac.sql` creates the server-wide roles `dcd_student` and `dcd_admin` the first time.
 
 ---
 
@@ -135,6 +144,8 @@ STUDY_AVAILABILITY (availability_id PK, user_id FK→USERS, available_date, avai
                     UQ(user_id, available_date)
 TASK_DEPENDENCIES  (dependency_id PK, task_id FK→TASKS, prerequisite_task_id FK→TASKS)
                     UQ(task_id, prerequisite_task_id)
+TASK_NOTES         (note_id PK, task_id FK→TASKS, doc JSONB, created_at, updated_at)
+TASK_EMBEDDINGS    (task_id PK FK→TASKS, embedding REAL[384], model, embedded_at)
 ```
 
 ---
@@ -156,11 +167,14 @@ Functional dependencies (non-trivial):
 | OFFICE_HOURS | office_hour_id → all | {office_hour_id} |
 | TEAMS | team_id → all | {team_id} |
 | TEAM_MEMBERS | member_id → all; team_id, srn → all | {member_id}, {team_id, srn} |
+| TASK_NOTES | note_id → all | {note_id} |
+| TASK_EMBEDDINGS | task_id → all | {task_id} |
 
 Work mode (team or individual) is not stored: it is derived from whether `team_id` is NULL (in `v_task_details`), so it can never disagree with the team assignment. Office hours are rows, not a text column, so each slot is atomic (1NF) and can be queried by day.
 
 - **1NF:** all attributes are atomic; no repeating groups (dependencies are rows, not a list column).
 - **2NF / 3NF / BCNF:** in every relation the determinant of each FD is a candidate key, so all six relations are in BCNF.
+- **Documents and vectors:** `task_notes.doc` is a JSONB document, which is not atomic in the 1NF sense on purpose: it is the NoSQL part of the design and holds only free-form note content, never data the relational tables depend on. `task_embeddings.embedding` is derived from task and note text, like `search_vector`, and is kept current by triggers.
 - **One honest exception:** `tasks.search_vector` is derived from `title` and `description` (task_id → title, description → search_vector), which is a transitive dependency. It is a `GENERATED ALWAYS ... STORED` column, so the DBMS recomputes it on every write and it cannot become inconsistent. It is a deliberate denormalization for indexing, not an update anomaly.
 - **Decisions that avoid anomalies:** course_code is not copied into tasks; weekly totals, risk levels and collisions are never stored but computed by functions and views, so they cannot go stale.
 
@@ -183,7 +197,39 @@ Assumptions to state in the viva: estimated hours are taken as given (no partial
 
 ---
 
-## 6. Syllabus coverage
+## 6. Document store, vector store and access control
+
+### NoSQL document store (`06_documents.sql`)
+
+`task_notes` is a schemaless collection: one JSONB document per note. Only `text` is required (a `CHECK`); `tags` and `checklist` must be arrays when present, and any other key is allowed, so one seeded note has `links` and another has a `split` object. A `GIN (doc jsonb_path_ops)` index serves containment queries.
+
+| Operation | SQL |
+|---|---|
+| Create | `INSERT ... fn_make_note_doc(text, tags[], checklist[])` |
+| Read | `doc @> '{"tags": ["viva"]}'`, `doc ? 'split'`, `jsonb_array_elements_text(doc->'tags')`, view `v_task_notes` |
+| Update | tick an item: `jsonb_set(doc, '{checklist,0,done}', 'true')`; add a tag: `doc->'tags' \|\| '"urgent"'`; drop a key: `doc #- '{remind_on}'` |
+| Delete | remove a tag: `(doc->'tags') - 'urgent'`; remove the document: `DELETE` (also cascades from its task) |
+
+### Vector store (`07_vectors.sql`)
+
+`task_embeddings` holds one 384-dimension unit vector per task, built from its title, description, subject and note texts. `fn_embed` hashes words and character trigrams into the 384 slots (the hashing trick), so typos still land close: "datbase projct" finds the DBMS mini project. Similarity is the cosine of two vectors (`fn_cosine`). Triggers keep the store current: inserting or editing a task, or adding, editing or deleting one of its notes, re-embeds that task; deleting a task cascades to its vector.
+
+- Read: `fn_similar_tasks(task, k)` (nearest neighbours) and `fn_vector_search(user, text, k)`.
+- Update: automatic re-embedding through `tasks_embed` and `task_notes_embed`.
+- Delete: `ON DELETE CASCADE`, and `fn_refresh_embedding` removes the vector of a task that no longer exists.
+
+Vectors are plain `REAL[]`, so nothing has to be installed. With the pgvector extension the column would be `vector(384)` and the similarity the `<=>` operator.
+
+### Roles and access control (`08_rbac.sql`)
+
+- **Two application roles.** `users.role` is `STUDENT` or `ADMIN`. `sp_admin_set_role` and `sp_admin_add_course` call `fn_assert_admin`, which raises `insufficient_privilege` for anyone else; `v_admin_overview` is read as `WHERE fn_is_admin(<caller>)`, so a student gets no rows. The last admin can't be demoted.
+- **Database roles.** `dcd_student` can read the catalogue, work on its own rows and read `users` without the `password_hash` column (a column-level `GRANT`). `dcd_admin` has everything.
+- **Row-level security** on users, enrollments, tasks, dependencies, availability, teams, team members, notes and embeddings: a `dcd_student` session sees only rows of the student named in `app.user_id`. Views are `security_invoker`, so they obey the same policies.
+- The web app connects as the table owner, which bypasses row-level security, so it relies on the role checks above and on `user_id` in every query. `demo/rbac.sql` shows the policies at work in psql.
+
+---
+
+## 7. Syllabus coverage
 
 | Unit | Topic | Where |
 |---|---|---|
@@ -206,12 +252,15 @@ Assumptions to state in the viva: estimated hours are taken as given (no partial
 | 4 | Transactions, atomicity, savepoints | procedures, multi-day availability save as one statement, `demo/transactions.sql` scenarios 1 and 5 |
 | 4 | Concurrency control and locking | `SELECT ... FOR UPDATE` in fixed order (no deadlock), `pg_advisory_xact_lock` against concurrent cycles, isolation levels (`demo/transactions.sql` scenarios 2 to 4) |
 | 4 | Web application with Next.js and SQL | `web/` |
+| - | NoSQL document store | `06_documents.sql`: JSONB documents, GIN index, `@>`, `jsonb_set`, `#-`; `demo/nosql_vector.sql` |
+| - | Vector store and similarity search | `07_vectors.sql`: embeddings, cosine similarity, re-embedding triggers |
+| - | Authorization and roles | `08_rbac.sql`: ADMIN procedures, `CREATE ROLE`, `GRANT` (incl. column-level), row-level security policies; `demo/rbac.sql` |
 
-Not used, on purpose: NoSQL, Neo4j and vector databases. The dependency graph is small and per-student, so a recursive CTE handles it inside the relational model.
+Not used, on purpose: Neo4j. The dependency graph is small and per-student, so a recursive CTE handles it inside the relational model.
 
 ---
 
-## 7. Suggested viva walkthrough (about 10 minutes)
+## 8. Suggested viva walkthrough (about 12 minutes)
 
 1. Log in as Aarav. Dashboard: overloaded week, collision clusters, red high-risk days on the pressure strip. (Seed dates are relative to today, so exact numbers shift slightly with the weekday.)
 2. Feasibility table: point at a CRITICAL row (negative slack) and explain the EDF argument.
@@ -223,10 +272,12 @@ Not used, on purpose: NoSQL, Neo4j and vector databases. The dependency graph is
 8. Search `spark OR kafka` on the Tasks page (full-text search with highlighted snippet).
 9. Availability: drop a weekend to 0 hours, save, return to the dashboard and show the risk change.
 10. In psql, run `demo/transactions.sql` scenario 3 in two terminals to show the concurrent-cycle protection.
+11. On the mini project task page, tick a checklist item and add a tag in a note (JSONB update), then open Notes and filter by that tag. Show "similar tasks" and search `datbase projct` with **similar meaning** on the Tasks page.
+12. Sign in as `admin@dcd.edu`: the admin page lists every account. In psql, run `demo/rbac.sql` to show a student refused by the admin procedure and `dcd_student` seeing only its own rows.
 
 ---
 
-## 8. Formal Project Report
+## 9. Formal Project Report
 
 A formal project report is prepared and documented in [`DBMS MINI PROJECT REPORT - DEADLINE COLLISION DETECTOR.docx`](DBMS%20MINI%20PROJECT%20REPORT%20-%20DEADLINE%20COLLISION%20DETECTOR.docx). The report is structured into 11 chapters aligned with the course syllabus and viva requirements:
 
@@ -237,8 +288,8 @@ A formal project report is prepared and documented in [`DBMS MINI PROJECT REPORT
 5. **DML Operations**: CRUD workflows, seed data generation, and atomic state updates (`db/05_seed.sql`).
 6. **Nested, Correlated, Recursive and Join Queries**: Analytical queries demonstrating joins, subqueries, and set operations (`db/demo/analytics_queries.sql`).
 7. **Advanced SQL Concepts**: Stored procedures, triggers, recursive CTEs, and window analytics (`db/03_functions_triggers.sql`, `db/04_procedures.sql`).
-8. **NoSQL / Vector Feature & Full-Text Search**: Native PostgreSQL tsvector indexing with GIN indexes and weighted ranking.
+8. **NoSQL / Vector Feature & Full-Text Search**: JSONB document store with read/update/delete, in-database vector store with similarity search, and tsvector full-text search.
 9. **Next.js Interface**: Modern full-stack interface featuring interactive dashboards, collision visualizers, task filters, and course directories.
-10. **Backend Integration & Authentication**: Direct PostgreSQL pooling with `pg`, cookie sessions, and role-based access control.
+10. **Backend Integration & Authentication**: Direct PostgreSQL pooling with `pg`, cookie sessions, STUDENT and ADMIN roles, database roles, GRANTs and row-level security.
 11. **Technology Justification & Individual Contribution**: Technical design rationale, reproducibility instructions, and detailed member contribution records.
 

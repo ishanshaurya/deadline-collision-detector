@@ -133,6 +133,14 @@ Kept, with reasons:
 - The demo scripts repeat literal arguments and predicates on purpose, to illustrate syllabus constructs; a missing row fails loudly.
 - Row types are hand-written next to each query. Every column was checked and nothing drifts today.
 
+## 15. Document store, vector store and roles (rubric additions)
+
+- **Documents in JSONB, not a second database.** Notes are the one part of the data with no fixed shape (some have checklists, links or a time split, some only text), so they live in a JSONB collection with a GIN index. A separate MongoDB would duplicate task ids across two systems with no foreign keys between them; inside PostgreSQL the note still cascades with its task.
+- **Vectors without an extension.** Embeddings are `REAL[384]` built in SQL with the hashing trick over words and character trigrams, and similarity is a SQL cosine. This runs on any PostgreSQL 15 without installing pgvector, which matters for a demo on someone else's machine. 128 dimensions collided too often (a typo query ranked ML tasks above the DBMS one); 384 with filler words removed put the right task first for every test query.
+- **Re-embedding is a trigger, not app code.** Any write path (app, psql, a procedure) keeps vectors current. `fn_refresh_embedding` is `SECURITY DEFINER` so a row-level-security session can refresh its own vectors without write access to the store, and it deletes the vector when the task is gone, because a note removed by its task's cascade fires the note trigger after the task row is deleted.
+- **Admin checks live in the database.** `sp_admin_*` and `v_admin_overview WHERE fn_is_admin(caller)` refuse a non-admin whichever client calls them; the app's `requireAdmin` only decides what to show.
+- **Row-level security is for database roles; the app connects as the owner.** Making the app switch role per request would mean a transaction around every query. The policies, column-level `GRANT` on `users` and `security_invoker` views are demonstrated in `demo/rbac.sql` instead.
+
 ## Special cases that remain (the system needs them)
 
 - `sp_reschedule_task` cascades only when the deadline moves later; moving earlier never invalidates dependents.
